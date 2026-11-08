@@ -222,14 +222,27 @@ body.open #drawer{transform:none}
 <div id="sheet">
   <div class="card">
     <h3>Настройки</h3>
+    <label for="s-prov">Источник ответов</label>
+    <select id="s-prov"><option value="groq">Groq (бесплатно)</option><option value="custom">Свой сервер (Claude Opus и др.)</option></select>
+    <div id="grp-custom" style="display:none">
+      <label for="s-curl">Адрес сервера</label>
+      <input id="s-curl" type="text" placeholder="https://anymodel.org/v1" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <label for="s-ckey">API ключ сервера</label>
+      <input id="s-ckey" type="password" placeholder="sk-..." autocomplete="off" autocapitalize="off" spellcheck="false">
+      <label for="s-cmodel">Модель</label>
+      <input id="s-cmodel" type="text" placeholder="cc/claude-opus-5-5" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <div class="hint">Подойдёт любой сервер в формате OpenAI. Голосовой ввод всё равно использует ключ Groq ниже.</div>
+    </div>
     <label for="s-key">Groq API ключ</label>
     <input id="s-key" type="password" placeholder="gsk_..." autocomplete="off" autocapitalize="off" spellcheck="false">
     <div class="hint">Бесплатный ключ: <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>. Хранится только в памяти этого устройства.</div>
+    <div id="grp-groq">
     <label for="s-model">Модель</label>
     <select id="s-model"></select>
     <button class="mini" id="s-refresh">Загрузить список моделей из Groq</button>
     <label for="s-vmodel">Модель для фото</label>
     <select id="s-vmodel"></select>
+    </div>
     <label for="s-sys">Системная инструкция</label>
     <textarea id="s-sys"></textarea>
     <label class="sw"><span>Озвучивать ответы</span><input type="checkbox" id="s-speak"></label>
@@ -251,7 +264,7 @@ const DEFAULT_MODELS = ['openai/gpt-oss-120b','openai/gpt-oss-20b'];
 
 let chats = store.get('pf_chats', []);
 let curId = store.get('pf_cur', null);
-let cfg = Object.assign({ key:'', model:DEFAULT_MODELS[0], system:DEFAULT_SYS, models:DEFAULT_MODELS, visionModel:'qwen/qwen3.6-27b' }, store.get('pf_cfg', {}));
+let cfg = Object.assign({ key:'', model:DEFAULT_MODELS[0], system:DEFAULT_SYS, models:DEFAULT_MODELS, visionModel:'qwen/qwen3.6-27b', provider:'groq', customUrl:'https://anymodel.org/v1', customKey:'', customModel:'cc/claude-opus-5-5' }, store.get('pf_cfg', {}));
 function migrate(){
   if (/llama-4-scout/.test(cfg.visionModel || '')) cfg.visionModel = 'qwen/qwen3.6-27b';
   if (/llama-3\.3-70b|llama-3\.1-8b/.test(cfg.model)) cfg.model = DEFAULT_MODELS[0];
@@ -278,6 +291,10 @@ const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 
 const hhmm = t => new Date(t).toLocaleTimeString('ru-RU', { hour:'2-digit', minute:'2-digit' });
 const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 
+function api(){
+  if (cfg.provider === 'custom') return { custom:true, url:(cfg.customUrl || 'https://anymodel.org/v1').replace(/\/+$/, '') + '/chat/completions', key:cfg.customKey, model:cfg.customModel || 'cc/claude-opus-5-5' };
+  return { custom:false, url:'https://api.groq.com/openai/v1/chat/completions', key:cfg.key, model:cfg.model };
+}
 let _pl = 0;
 function plogo(mini){
   const u = 'rb' + (++_pl), G = 'url(#' + u + 'g)';
@@ -328,7 +345,7 @@ function md(t){
 /* ---------- render ---------- */
 const chatEl = $('#chat');
 function welcome(){
-  const hasKey = !!cfg.key;
+  const hasKey = !!api().key;
   chatEl.innerHTML = `<div class="welcome">
     <div class="lw" id="lw"><div class="aura"></div>${plogo(false)}</div>
     <h2>Привет!</h2>
@@ -454,10 +471,11 @@ const GEN_RE = /^\s*(?:нарисуй(?:те)?(?=[\s:,]|$)|draw(?=[\s:,]|$)|imag
 
 async function enhancePrompt(p, signal){
   try {
-    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const A = api();
+    const r = await fetch(A.url, {
       method:'POST', signal,
-      headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer ' + cfg.key },
-      body: JSON.stringify({ model: cfg.model, stream:false, max_tokens:1200, messages:[
+      headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer ' + A.key },
+      body: JSON.stringify({ model: A.model, stream:false, max_tokens:1200, messages:[
         { role:'system', content:'You write prompts for an AI image generator. Translate the user request to English and expand it into one vivid, detailed prompt (subject, style, lighting, composition). Output only the prompt, no quotes, no explanations. Max 60 words.' },
         { role:'user', content:p } ] })
     });
@@ -529,7 +547,8 @@ async function send(){
   const inp = $('#inp');
   const text = inp.value.trim();
   if (!text && !pending) return;
-  if (!cfg.key) { openSettings(); return; }
+  const A = api();
+  if (!A.key) { openSettings(); return; }
   const speakIt = voiceNext || cfg.speakAll; voiceNext = false;
   const att = pending; pending = null;
   const wantGen = !att && (genMode || GEN_RE.test(text));
@@ -571,20 +590,20 @@ async function send(){
     }
     history.push({ role:m.role, content:m.content });
   }
-  const payload = { model: useVision ? cfg.visionModel : cfg.model, stream: true, messages: [{ role:'system', content: cfg.system || DEFAULT_SYS }, ...history] };
+  const payload = { model: A.custom ? A.model : (useVision ? cfg.visionModel : cfg.model), stream: true, messages: [{ role:'system', content: cfg.system || DEFAULT_SYS }, ...history] };
 
   ctrl = new AbortController();
   setBusy(true);
   let full = '', visionIds = [];
   try {
-    const doFetch = () => fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const doFetch = () => fetch(A.url, {
       method:'POST',
-      headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer ' + cfg.key },
+      headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer ' + A.key },
       body: JSON.stringify(payload),
       signal: ctrl.signal
     });
     let res = await doFetch();
-    if (!res.ok && (res.status === 404 || res.status === 400)) {
+    if (!res.ok && !A.custom && (res.status === 404 || res.status === 400)) {
       if (useVision) {
         visionIds = await listModels();
         const tried = new Set([payload.model]);
@@ -604,14 +623,20 @@ async function send(){
     if (!res.ok) {
       let msg = 'Ошибка ' + res.status;
       try { const j = await res.json(); msg = (j.error && j.error.message) || msg; } catch(e){}
-      if (useVision && (res.status === 404 || res.status === 400)) msg = 'Не нашёл модель Groq, которая принимает фото' + (visionIds.length ? '. Доступные модели: ' + visionIds.join(', ') : '') + '. Попробуй выбрать другую в Настройках, поле «Модель для фото».';
+      if (useVision && !A.custom && (res.status === 404 || res.status === 400)) msg = 'Не нашёл модель Groq, которая принимает фото' + (visionIds.length ? '. Доступные модели: ' + visionIds.join(', ') : '') + '. Попробуй выбрать другую в Настройках, поле «Модель для фото».';
       if (res.status === 401) msg = 'Неверный API ключ. Проверь его в настройках.';
-      if (res.status === 429) msg = 'Превышен лимит запросов Groq. Подожди немного и повтори.';
+      if (res.status === 429) msg = 'Превышен лимит запросов. Подожди немного и повтори.';
       throw new Error(msg);
     }
-    const reader = res.body.getReader(), dec = new TextDecoder();
+    const jsonMode = (res.headers.get('content-type') || '').includes('application/json');
+    if (jsonMode) {
+      const j = await res.json();
+      full = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
+      fillBubble(bub, { role:'assistant', content:full });
+    }
+    const reader = jsonMode ? null : res.body.getReader(), dec = new TextDecoder();
     let buf = '';
-    while (true) {
+    while (!jsonMode) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += dec.decode(value, { stream:true });
@@ -707,7 +732,7 @@ if (canRec) {
     try { if (speechSynthesis.speaking) speechSynthesis.cancel(); } catch(e){}
     if (mr && mr.state === 'recording') { mr.stop(); return; }
     if (busy) return;
-    if (!cfg.key) { openSettings(); return; }
+    if (!cfg.key) { alert('Для голосового ввода нужен ключ Groq: добавь его в Настройках.'); openSettings(); return; }
     try { stream = await navigator.mediaDevices.getUserMedia({ audio:true }); }
     catch(e){ alert('Нет доступа к микрофону. Разреши его: Настройки iPhone → Safari → Микрофон.'); return; }
     const mime = ['audio/mp4', 'audio/webm', 'audio/ogg'].find(t => MediaRecorder.isTypeSupported(t)) || '';
@@ -765,10 +790,17 @@ function storageStatus(){
   const standalone = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
   $('#s-store').textContent = 'Хранилище: ' + (ls ? 'работает' : 'НЕ работает (отключи приватный режим Safari)') + ' · ' + (standalone ? 'открыто с экрана «Домой»' : 'открыто во вкладке Safari');
 }
+function provToggle(){ const c = $('#s-prov').value === 'custom'; $('#grp-custom').style.display = c ? '' : 'none'; $('#grp-groq').style.display = c ? 'none' : ''; }
+$('#s-prov').onchange = provToggle;
 function openSettings(){
   $('#s-speak').checked = !!cfg.speakAll;
   storageStatus();
   $('#s-key').value = cfg.key;
+  $('#s-prov').value = cfg.provider || 'groq';
+  $('#s-curl').value = cfg.customUrl || '';
+  $('#s-ckey').value = cfg.customKey || '';
+  $('#s-cmodel').value = cfg.customModel || '';
+  provToggle();
   $('#s-sys').value = cfg.system;
   fillModels(cfg.models, cfg.model);
   fillModels(cfg.allModels || [cfg.visionModel], cfg.visionModel, '#s-vmodel');
@@ -779,6 +811,10 @@ $('#s-cancel').onclick = closeSettings;
 $('#sheet').addEventListener('click', e => { if (e.target.id === 'sheet') closeSettings(); });
 $('#s-save').onclick = () => {
   cfg.key = $('#s-key').value.trim();
+  cfg.provider = $('#s-prov').value;
+  cfg.customUrl = $('#s-curl').value.trim() || 'https://anymodel.org/v1';
+  cfg.customKey = $('#s-ckey').value.trim();
+  cfg.customModel = $('#s-cmodel').value.trim() || 'cc/claude-opus-5-5';
   cfg.model = $('#s-model').value;
   cfg.visionModel = $('#s-vmodel').value;
   cfg.system = $('#s-sys').value.trim() || DEFAULT_SYS;
