@@ -115,6 +115,19 @@ body.open #drawer{transform:none}
 .btn.d{color:#ff9aaa}
 .mini{font-size:13px;color:var(--accent);padding:4px 0;margin-top:6px}
 
+/* images */
+.bubble img.pic{display:block;width:100%;border-radius:14px;margin:0 0 8px;background:rgba(255,255,255,.05);object-fit:cover}
+.msg.user .bubble img.pic{width:auto;max-width:100%;max-height:280px}
+.bubble img.gen{aspect-ratio:1/1;animation:sh 1.6s infinite}
+.bubble img.gen.ok{animation:none}
+@keyframes sh{0%,100%{opacity:.45}50%{opacity:1}}
+.rt{display:inline-block;margin:0 0 8px;padding:9px 14px;border-radius:12px;border:1px solid var(--line);background:var(--bubble);font-size:14px;color:#cfd2ff}
+#chip{display:none;align-items:center;gap:10px;padding:0 8px 8px}
+#chip.show{display:flex}
+#chip img{width:46px;height:46px;border-radius:10px;object-fit:cover;border:1px solid var(--line)}
+#chip span{flex:1;font-size:13.5px;color:var(--dim)}
+#chip button{width:32px;height:32px;border-radius:50%;background:var(--bubble);font-size:18px;color:#cfd2ff}
+
 /* popover */
 #pop{position:absolute;left:14px;bottom:calc(var(--sab) + 70px);background:#12162c;border:1px solid var(--line);border-radius:16px;padding:6px;display:none;z-index:10;min-width:210px;box-shadow:0 10px 40px rgba(0,0,0,.5)}
 #pop.show{display:block}
@@ -134,12 +147,15 @@ body.open #drawer{transform:none}
   <main id="chat"></main>
 
   <div id="pop">
+    <button id="p-photo">Прикрепить фото</button>
+    <button id="p-gen">Создать картинку</button>
     <button id="p-voice">Озвучка ответов: выкл</button>
     <button id="p-clear">Очистить этот чат</button>
     <button id="p-set">Настройки</button>
   </div>
 
   <footer>
+    <div id="chip"><img id="chip-img" alt=""><span id="chip-t"></span><button id="chip-x" aria-label="Убрать">×</button></div>
     <div class="bar">
       <button class="ib" id="plus" aria-label="Меню"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
       <textarea id="inp" rows="1" placeholder="Спросите о чём угодно..."></textarea>
@@ -149,6 +165,7 @@ body.open #drawer{transform:none}
   </footer>
 </div>
 
+<input type="file" id="file" accept="image/*" hidden>
 <div id="scrim"></div>
 <aside id="drawer">
   <div class="dh"><img class="logo" src="icon.png" alt=""><b>PAFOOS AI</b></div>
@@ -186,13 +203,13 @@ const DEFAULT_MODELS = ['openai/gpt-oss-120b','openai/gpt-oss-20b'];
 
 let chats = store.get('pf_chats', []);
 let curId = store.get('pf_cur', null);
-let cfg = Object.assign({ key:'', model:DEFAULT_MODELS[0], system:DEFAULT_SYS, models:DEFAULT_MODELS }, store.get('pf_cfg', {}));
+let cfg = Object.assign({ key:'', model:DEFAULT_MODELS[0], system:DEFAULT_SYS, models:DEFAULT_MODELS, visionModel:'meta-llama/llama-4-scout-17b-16e-instruct' }, store.get('pf_cfg', {}));
 function migrate(){
   if (/llama-3\.3-70b|llama-3\.1-8b/.test(cfg.model)) cfg.model = DEFAULT_MODELS[0];
   if ((cfg.models || []).some(m => /llama-3\.3-70b|llama-3\.1-8b/.test(m))) cfg.models = DEFAULT_MODELS;
 }
 migrate();
-let busy = false, ctrl = null;
+let busy = false, ctrl = null, pending = null, genMode = false;
 
 /* IndexedDB + cookie mirror: если iOS очистит localStorage, данные вернутся */
 function idb(){ return new Promise((res, rej) => { const r = indexedDB.open('pafoos', 1); r.onupgradeneeded = () => r.result.createObjectStore('kv'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
@@ -248,17 +265,41 @@ function msgEl(m){
   return d;
 }
 function fillBubble(b, m){
-  const body = m.role === 'user' ? esc(m.content).replace(/\n/g, '<br>') : md(m.content);
-  b.innerHTML = body + (m.t ? '<span class="t">' + hhmm(m.t) + '</span>' : '');
+  let pre = '';
+  if (m.imgs && m.imgs.length) pre += m.imgs.map(id => '<img class="pic" data-id="' + id + '" alt="">').join('');
+  if (m.gen) pre += '<img class="pic gen" src="' + esc(m.gen) + '" alt="">';
+  const txt = m.content || '';
+  const body = m.role === 'user' ? esc(txt).replace(/\n/g, '<br>') : md(txt);
+  b.innerHTML = pre + body + (m.t ? '<span class="t">' + hhmm(m.t) + '</span>' : '');
+  if (pre) hookImgs(b);
+}
+function stickBottom(){ if (chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 600) chatEl.scrollTop = chatEl.scrollHeight; }
+function hookImgs(b){
+  b.querySelectorAll('img.pic[data-id]').forEach(im => {
+    im.onload = stickBottom;
+    getImg(im.dataset.id).then(s => { if (s) im.src = s; else im.remove(); });
+  });
+  b.querySelectorAll('img.gen').forEach(im => {
+    im.onload = () => { im.classList.add('ok'); stickBottom(); };
+    im.onerror = () => {
+      const r = document.createElement('button'); r.className = 'rt'; r.textContent = 'Не загрузилось. Повторить';
+      r.onclick = () => {
+        let u; try { u = new URL(im.src); u.searchParams.set('r', Date.now()); } catch(e){ return; }
+        const n = document.createElement('img'); n.className = 'pic gen'; n.alt = ''; n.src = u.toString();
+        r.replaceWith(n); hookImgs(b);
+      };
+      im.replaceWith(r);
+    };
+  });
 }
 function inChat(){ const c = cur(); return !!(c && c.messages.length); }
 function syncUI(){
   const ch = inChat();
-  if (!(typeof mr !== 'undefined' && mr && mr.state === 'recording')) $('#inp').placeholder = ch ? 'Сообщение...' : 'Спросите о чём угодно...';
+  if (!(typeof mr !== 'undefined' && mr && mr.state === 'recording')) $('#inp').placeholder = genMode ? 'Опиши, что нарисовать...' : (ch ? 'Сообщение...' : 'Спросите о чём угодно...');
   const mic = $('#mic'); if (mic) mic.style.display = window.__sr ? '' : 'none';
   const hide = !ch && !chats.length;
   $('#menu').classList.toggle('hide', hide); $('#new').classList.toggle('hide', hide);
-  $('#send').classList.toggle('idle', !ch && !busy && !$('#inp').value.trim());
+  $('#send').classList.toggle('idle', !ch && !busy && !pending && !$('#inp').value.trim());
 }
 function renderChat(){
   syncUI();
@@ -301,6 +342,80 @@ function setBusy(v){
     : '<svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
 }
 
+/* ---- картинки: хранение, сжатие ---- */
+const imgCache = new Map();
+async function putImg(id, d){ imgCache.set(id, d); idbSet('img_' + id, d); }
+async function getImg(id){ if (imgCache.has(id)) return imgCache.get(id); const v = await idbGet('img_' + id); if (v) imgCache.set(id, v); return v; }
+function fileToDataUrl(file, max){
+  max = max || 1280;
+  return new Promise((res, rej) => {
+    const url = URL.createObjectURL(file), im = new Image();
+    im.onload = () => {
+      let w = im.naturalWidth, h = im.naturalHeight; const k = Math.min(1, max / Math.max(w, h));
+      w = Math.round(w * k); h = Math.round(h * k);
+      const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+      cv.getContext('2d').drawImage(im, 0, 0, w, h); URL.revokeObjectURL(url);
+      res(cv.toDataURL('image/jpeg', 0.85));
+    };
+    im.onerror = () => rej(new Error('Не удалось открыть фото'));
+    im.src = url;
+  });
+}
+function syncChips(){
+  $('#chip').classList.toggle('show', !!(pending || genMode));
+  const ci = $('#chip-img'); ci.style.display = pending ? '' : 'none'; if (pending) ci.src = pending.data;
+  $('#chip-t').textContent = pending ? 'Фото прикреплено. Спроси о нём или попроси прочитать текст' : (genMode ? 'Режим: создание картинки' : '');
+  syncUI();
+}
+
+const GEN_RE = /^\s*(?:нарисуй(?:те)?(?=[\s:,]|$)|draw(?=[\s:,]|$)|imagine(?=[\s:,]|$)|(?:сгенерируй|создай|сделай|generate|make|create)(?:те)?\s+(?:мне\s+)?(?:новую\s+)?(?:картинку|изображение|фото|фотографию|рисунок|арт|image|picture|photo)(?=[\s:,]|$))[:,]?\s*/i;
+
+async function enhancePrompt(p, signal){
+  try {
+    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method:'POST', signal,
+      headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer ' + cfg.key },
+      body: JSON.stringify({ model: cfg.model, stream:false, max_tokens:1200, messages:[
+        { role:'system', content:'You write prompts for an AI image generator. Translate the user request to English and expand it into one vivid, detailed prompt (subject, style, lighting, composition). Output only the prompt, no quotes, no explanations. Max 60 words.' },
+        { role:'user', content:p } ] })
+    });
+    if (!r.ok) return p;
+    const j = await r.json();
+    return ((j.choices && j.choices[0] && j.choices[0].message.content) || '').trim() || p;
+  } catch(e){ if (e.name === 'AbortError') throw e; return p; }
+}
+
+async function generateImage(c, text){
+  const am = { role:'assistant', content:'', t:Date.now() };
+  const el = msgEl(am);
+  el.querySelector('.bubble').innerHTML = '<span class="dots"><span></span><span></span><span></span></span> Рисую...';
+  chatEl.appendChild(el); chatEl.scrollTop = chatEl.scrollHeight;
+  ctrl = new AbortController(); setBusy(true);
+  try {
+    let p = text.replace(GEN_RE, '').trim() || text;
+    p = await enhancePrompt(p, ctrl.signal);
+    const seed = Math.floor(Math.random() * 1e9);
+    am.gen = 'https://image.pollinations.ai/prompt/' + encodeURIComponent(p) + '?width=1024&height=1024&model=flux&nologo=true&seed=' + seed;
+    am.prompt = p; am.t = Date.now();
+    c.messages.push(am);
+  } catch(e){
+    if (e.name !== 'AbortError') c.messages.push({ role:'assistant', content:e.message || 'Не удалось создать картинку.', t:Date.now(), err:true });
+  } finally {
+    ctrl = null; setBusy(false); c.updated = Date.now(); save(); renderChat(); renderList();
+  }
+}
+
+async function pickVision(){
+  try {
+    const r = await fetch('https://api.groq.com/openai/v1/models', { headers:{ Authorization:'Bearer ' + cfg.key } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const ids = j.data.map(m => m.id);
+    const pref = ['meta-llama/llama-4-scout-17b-16e-instruct', 'qwen/qwen3.6-27b', 'meta-llama/llama-4-maverick-17b-128e-instruct'];
+    return pref.find(p => ids.includes(p)) || ids.find(id => /scout|maverick|vision|qwen3\.6|qwen.*vl/i.test(id)) || null;
+  } catch(e){ return null; }
+}
+
 async function pickModel(){
   try {
     const r = await fetch('https://api.groq.com/openai/v1/models', { headers:{ Authorization:'Bearer ' + cfg.key } });
@@ -317,21 +432,26 @@ async function send(){
   if (busy) { stop(); return; }
   const inp = $('#inp');
   const text = inp.value.trim();
-  if (!text) return;
+  if (!text && !pending) return;
   if (!cfg.key) { openSettings(); return; }
   const speakIt = voiceNext || cfg.speakAll; voiceNext = false;
+  const att = pending; pending = null;
+  const wantGen = !att && (genMode || GEN_RE.test(text));
+  genMode = false; syncChips();
   try { speechSynthesis.cancel(); } catch(e){}
 
   let c = cur();
   if (!c) {
-    c = { id: uid(), title: text.slice(0, 40), messages: [], updated: Date.now() };
+    c = { id: uid(), title: (text || 'Фото').slice(0, 40), messages: [], updated: Date.now() };
     chats.push(c); curId = c.id;
   }
   const um = { role:'user', content:text, t:Date.now() };
+  if (att) um.imgs = [att.id];
   c.messages.push(um);
   c.updated = Date.now();
   inp.value = ''; autosize();
   save(); renderChat(); renderList();
+  if (wantGen) { await generateImage(c, text); return; }
 
   const am = { role:'assistant', content:'', t:Date.now() };
   const el = msgEl(am);
@@ -339,8 +459,23 @@ async function send(){
   bub.innerHTML = '<span class="dots"><span></span><span></span><span></span></span>';
   chatEl.appendChild(el); chatEl.scrollTop = chatEl.scrollHeight;
 
-  const history = c.messages.filter(m => !m.err).slice(-30).map(m => ({ role:m.role, content:m.content }));
-  const payload = { model: cfg.model, stream: true, messages: [{ role:'system', content: cfg.system || DEFAULT_SYS }, ...history] };
+  const slice = c.messages.filter(m => !m.err).slice(-30);
+  let lastImgIdx = -1; slice.forEach((m, i) => { if (m.imgs && m.imgs.length) lastImgIdx = i; });
+  const history = []; let useVision = false;
+  for (let i = 0; i < slice.length; i++) {
+    const m = slice[i];
+    if (m.gen) { history.push({ role:'assistant', content:'[Я создал картинку по запросу: ' + (m.prompt || '') + ']' }); continue; }
+    if (m.imgs && m.imgs.length) {
+      const t = m.content || 'Опиши, что на фото. Если на нём есть текст, прочитай его.';
+      if (i === lastImgIdx) {
+        const d = await getImg(m.imgs[0]);
+        if (d) { history.push({ role:'user', content:[{ type:'text', text:t }, { type:'image_url', image_url:{ url:d } }] }); useVision = true; continue; }
+      }
+      history.push({ role:'user', content:'[Пользователь прислал фото] ' + (m.content || '') }); continue;
+    }
+    history.push({ role:m.role, content:m.content });
+  }
+  const payload = { model: useVision ? cfg.visionModel : cfg.model, stream: true, messages: [{ role:'system', content: cfg.system || DEFAULT_SYS }, ...history] };
 
   ctrl = new AbortController();
   setBusy(true);
@@ -354,8 +489,11 @@ async function send(){
     });
     let res = await doFetch();
     if (!res.ok && (res.status === 404 || res.status === 400)) {
-      const alt = await pickModel();
-      if (alt && alt !== cfg.model) { cfg.model = alt; save(); payload.model = alt; res = await doFetch(); }
+      const alt = useVision ? await pickVision() : await pickModel();
+      if (alt && alt !== payload.model) {
+        if (useVision) cfg.visionModel = alt; else cfg.model = alt;
+        save(); payload.model = alt; res = await doFetch();
+      }
     }
     if (!res.ok) {
       let msg = 'Ошибка ' + res.status;
@@ -497,6 +635,14 @@ function voiceLabel(){ $('#p-voice').textContent = 'Озвучка ответо�
 $('#p-voice').onclick = () => { cfg.speakAll = !cfg.speakAll; save(); unlockTTS(); if (!cfg.speakAll) { try { speechSynthesis.cancel(); } catch(e){} } };
 $('#plus').addEventListener('click', voiceLabel);
 $('#p-set').onclick = openSettings;
+$('#p-photo').onclick = () => $('#file').click();
+$('#p-gen').onclick = () => { genMode = true; pending = null; syncChips(); inp.focus(); };
+$('#chip-x').onclick = () => { pending = null; genMode = false; syncChips(); };
+$('#file').onchange = async e => {
+  const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+  try { const d = await fileToDataUrl(f); const id = uid(); await putImg(id, d); pending = { id, data:d }; genMode = false; syncChips(); }
+  catch(err){ alert(err.message || 'Не удалось открыть фото'); }
+};
 $('#p-clear').onclick = () => {
   const c = cur(); if (!c) return;
   if (!confirm('Очистить этот чат?')) return;
