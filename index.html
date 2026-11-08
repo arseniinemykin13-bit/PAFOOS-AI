@@ -285,7 +285,7 @@ textarea::placeholder{color:var(--muted)}
 <script>
 var SYSTEM_PROMPT = 'Ты — Pafoos AI, дружелюбный личный ИИ-помощник. Отвечай на языке пользователя, понятно и по делу.';
 var PROVIDERS = { claude: 'Claude', groq: 'Groq' };
-var DEFAULTS = { claudeKey: '', claudeModel: 'claude-sonnet-4-5', groqKey: '', groqModel: 'llama-3.3-70b-versatile' };
+var DEFAULTS = { claudeKey: '', claudeModel: 'cc/claude-opus-5-5', groqKey: '', groqModel: 'llama-3.3-70b-versatile' };
 var SUGGESTIONS = ['Объясни простыми словами, как работает ИИ', 'Помоги написать пост для Telegram', 'Придумай 5 идей для стартапа', 'Найди ошибку в моём коде'];
 
 function $(s) { return document.querySelector(s); }
@@ -484,23 +484,19 @@ async function readSSE(res, onData) {
 }
 
 async function streamClaude(messages, onDelta, signal) {
-  var res = await fetch('https://api.anthropic.com/v1/messages', {
+  var res = await fetch('https://anymodel.org/v1/chat/completions', {
     method: 'POST', signal: signal,
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': settings.claudeKey,
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true'
-    },
-    body: JSON.stringify({ model: settings.claudeModel, max_tokens: 4096, system: SYSTEM_PROMPT, messages: messages, stream: true })
+    headers: { 'content-type': 'application/json', 'authorization': 'Bearer ' + settings.claudeKey },
+    body: JSON.stringify({ model: settings.claudeModel, messages: [{ role: 'system', content: SYSTEM_PROMPT }].concat(messages), stream: true })
   });
   if (!res.ok) throw new Error(await errorText(res));
   await readSSE(res, function (j) {
-    if (j.type === 'content_block_delta' && j.delta && j.delta.type === 'text_delta') onDelta(j.delta.text);
-    if (j.type === 'error') throw new Error((j.error && j.error.message) || 'Ошибка API');
+    if (j.error) throw new Error(j.error.message || 'Ошибка API');
+    var t = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
+    if (t) onDelta(t);
   });
 }
-
+  
 async function streamGroq(messages, onDelta, signal) {
   var res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST', signal: signal,
