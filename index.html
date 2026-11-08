@@ -134,6 +134,7 @@ body.open #drawer{transform:none}
   <main id="chat"></main>
 
   <div id="pop">
+    <button id="p-voice">Озвучка ответов: выкл</button>
     <button id="p-clear">Очистить этот чат</button>
     <button id="p-set">Настройки</button>
   </div>
@@ -168,6 +169,7 @@ body.open #drawer{transform:none}
     <button class="mini" id="s-refresh">Загрузить список моделей из Groq</button>
     <label for="s-sys">Системная инструкция</label>
     <textarea id="s-sys"></textarea>
+    <div class="hint" id="s-store"></div>
     <div class="row"><button class="btn d" id="s-wipe">Удалить всю историю</button></div>
     <div class="row"><button class="btn" id="s-cancel">Отмена</button><button class="btn p" id="s-save">Сохранить</button></div>
   </div>
@@ -180,14 +182,31 @@ const store = {
   set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)) }catch(e){} }
 };
 const DEFAULT_SYS = 'Ты — Pafoos AI, дружелюбный личный ИИ-помощник. Отвечай на языке пользователя, понятно и по делу.';
-const DEFAULT_MODELS = ['llama-3.3-70b-versatile','llama-3.1-8b-instant','openai/gpt-oss-120b','openai/gpt-oss-20b'];
+const DEFAULT_MODELS = ['openai/gpt-oss-120b','openai/gpt-oss-20b'];
 
 let chats = store.get('pf_chats', []);
 let curId = store.get('pf_cur', null);
 let cfg = Object.assign({ key:'', model:DEFAULT_MODELS[0], system:DEFAULT_SYS, models:DEFAULT_MODELS }, store.get('pf_cfg', {}));
+function migrate(){
+  if (/llama-3\.3-70b|llama-3\.1-8b/.test(cfg.model)) cfg.model = DEFAULT_MODELS[0];
+  if ((cfg.models || []).some(m => /llama-3\.3-70b|llama-3\.1-8b/.test(m))) cfg.models = DEFAULT_MODELS;
+}
+migrate();
 let busy = false, ctrl = null;
 
-const save = () => { store.set('pf_chats', chats); store.set('pf_cur', curId); store.set('pf_cfg', cfg); };
+/* IndexedDB + cookie mirror: если iOS очистит localStorage, данные вернутся */
+function idb(){ return new Promise((res, rej) => { const r = indexedDB.open('pafoos', 1); r.onupgradeneeded = () => r.result.createObjectStore('kv'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
+async function idbSet(k, v){ try { const d = await idb(); d.transaction('kv', 'readwrite').objectStore('kv').put(v, k); } catch(e){} }
+async function idbGet(k){ try { const d = await idb(); return await new Promise(res => { const q = d.transaction('kv').objectStore('kv').get(k); q.onsuccess = () => res(q.result); q.onerror = () => res(undefined); }); } catch(e){ return undefined; } }
+function ckSet(){ try { document.cookie = 'pf_k=' + encodeURIComponent(JSON.stringify({ key:cfg.key, model:cfg.model })) + ';max-age=31536000;path=/;SameSite=Lax'; } catch(e){} }
+function ckGet(){ try { const m = document.cookie.match(/(?:^|; )pf_k=([^;]*)/); return m ? JSON.parse(decodeURIComponent(m[1])) : null; } catch(e){ return null; } }
+const save = () => {
+  store.set('pf_chats', chats); store.set('pf_cur', curId); store.set('pf_cfg', cfg);
+  idbSet('pf_chats', chats); idbSet('pf_cur', curId); idbSet('pf_cfg', cfg); ckSet();
+};
+try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch(e){}
+addEventListener('pagehide', save);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') save(); });
 const cur = () => chats.find(c => c.id === curId);
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 const hhmm = t => new Date(t).toLocaleTimeString('ru-RU', { hour:'2-digit', minute:'2-digit' });
@@ -235,8 +254,8 @@ function fillBubble(b, m){
 function inChat(){ const c = cur(); return !!(c && c.messages.length); }
 function syncUI(){
   const ch = inChat();
-  $('#inp').placeholder = ch ? 'Сообщение...' : 'Спросите о чём угодно...';
-  const mic = $('#mic'); if (mic) mic.style.display = (ch && window.__sr) ? '' : 'none';
+  if (!(typeof mr !== 'undefined' && mr && mr.state === 'recording')) $('#inp').placeholder = ch ? 'Сообщение...' : 'Спросите о чём угодно...';
+  const mic = $('#mic'); if (mic) mic.style.display = window.__sr ? '' : 'none';
   const hide = !ch && !chats.length;
   $('#menu').classList.toggle('hide', hide); $('#new').classList.toggle('hide', hide);
   $('#send').classList.toggle('idle', !ch && !busy && !$('#inp').value.trim());
@@ -282,12 +301,26 @@ function setBusy(v){
     : '<svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
 }
 
+async function pickModel(){
+  try {
+    const r = await fetch('https://api.groq.com/openai/v1/models', { headers:{ Authorization:'Bearer ' + cfg.key } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const ids = j.data.map(m => m.id).filter(id => !/whisper|tts|guard|playai|orpheus|compound/i.test(id)).sort();
+    if (ids.length) cfg.models = ids;
+    const pref = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'];
+    return pref.find(p => ids.includes(p)) || ids[0] || null;
+  } catch(e){ return null; }
+}
+
 async function send(){
   if (busy) { stop(); return; }
   const inp = $('#inp');
   const text = inp.value.trim();
   if (!text) return;
   if (!cfg.key) { openSettings(); return; }
+  const speakIt = voiceNext || cfg.speakAll; voiceNext = false;
+  try { speechSynthesis.cancel(); } catch(e){}
 
   let c = cur();
   if (!c) {
@@ -313,12 +346,17 @@ async function send(){
   setBusy(true);
   let full = '';
   try {
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const doFetch = () => fetch('https://api.groq.com/openai/v1/chat/completions', {
       method:'POST',
       headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer ' + cfg.key },
       body: JSON.stringify(payload),
       signal: ctrl.signal
     });
+    let res = await doFetch();
+    if (!res.ok && (res.status === 404 || res.status === 400)) {
+      const alt = await pickModel();
+      if (alt && alt !== cfg.model) { cfg.model = alt; save(); payload.model = alt; res = await doFetch(); }
+    }
     if (!res.ok) {
       let msg = 'Ошибка ' + res.status;
       try { const j = await res.json(); msg = (j.error && j.error.message) || msg; } catch(e){}
@@ -352,6 +390,7 @@ async function send(){
     if (!full) throw new Error('Пустой ответ от модели.');
     am.content = full; am.t = Date.now();
     c.messages.push(am);
+    if (speakIt) speak(full);
   } catch (e) {
     if (e.name === 'AbortError') {
       if (full) { am.content = full; am.t = Date.now(); c.messages.push(am); }
@@ -376,20 +415,77 @@ inp.addEventListener('keydown', e => {
 });
 $('#send').onclick = send;
 
-// voice input
-const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-window.__sr = !!SR;
-if (SR) {
-  const mic = $('#mic');
-  let rec = null;
-  mic.onclick = () => {
-    if (rec) { rec.stop(); return; }
-    rec = new SR(); rec.lang = 'ru-RU'; rec.interimResults = false;
-    rec.onresult = e => { inp.value = (inp.value + ' ' + e.results[0][0].transcript).trim(); autosize(); };
-    rec.onend = () => { rec = null; mic.classList.remove('on'); };
-    rec.onerror = () => { rec = null; mic.classList.remove('on'); };
-    mic.classList.add('on');
-    try { rec.start(); } catch(e){ rec = null; mic.classList.remove('on'); }
+// ---- голосовой режим: запись -> Whisper (Groq) -> ответ -> озвучка ----
+let mr = null, chunks = [], stream = null, voiceNext = false;
+const canRec = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+window.__sr = canRec;
+const mic = $('#mic');
+
+function unlockTTS(){
+  try { const u = new SpeechSynthesisUtterance(' '); u.volume = 0; speechSynthesis.speak(u); } catch(e){}
+}
+function speak(t){
+  if (!('speechSynthesis' in window)) return;
+  try { speechSynthesis.cancel(); } catch(e){}
+  t = t.replace(/```[\s\S]*?```/g, ' Код я пропускаю. ').replace(/[*_#`>|]/g, '').replace(/\s+/g, ' ').trim();
+  if (!t) return;
+  const ru = /[а-яё]/i.test(t), lang = ru ? 'ru' : 'en';
+  const voices = speechSynthesis.getVoices().filter(v => v.lang && v.lang.toLowerCase().startsWith(lang));
+  const v = voices.find(v => /milena|yuri|enhanced|premium|siri/i.test(v.name)) || voices[0];
+  (t.match(/[^.!?\n]+[.!?]*/g) || [t]).forEach(s => {
+    s = s.trim(); if (!s) return;
+    const u = new SpeechSynthesisUtterance(s);
+    u.lang = ru ? 'ru-RU' : 'en-US'; if (v) u.voice = v; u.rate = 1;
+    speechSynthesis.speak(u);
+  });
+}
+if ('speechSynthesis' in window) speechSynthesis.getVoices();
+
+async function transcribe(blob, type){
+  const ext = type.includes('webm') ? 'webm' : type.includes('mp4') ? 'm4a' : 'ogg';
+  let lastErr = 'Не удалось распознать речь';
+  for (const model of ['whisper-large-v3-turbo', 'whisper-large-v3']) {
+    const fd = new FormData();
+    fd.append('file', blob, 'audio.' + ext); fd.append('model', model); fd.append('language', 'ru'); fd.append('response_format', 'json');
+    const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', { method:'POST', headers:{ Authorization:'Bearer ' + cfg.key }, body: fd });
+    if (r.ok) { const j = await r.json(); return (j.text || '').trim(); }
+    let m = 'Ошибка ' + r.status; try { const j = await r.json(); m = (j.error && j.error.message) || m; } catch(e){}
+    lastErr = m;
+    if (r.status !== 404 && r.status !== 400) break;
+  }
+  throw new Error(lastErr);
+}
+
+if (canRec) {
+  mic.onclick = async () => {
+    unlockTTS();
+    try { if (speechSynthesis.speaking) speechSynthesis.cancel(); } catch(e){}
+    if (mr && mr.state === 'recording') { mr.stop(); return; }
+    if (busy) return;
+    if (!cfg.key) { openSettings(); return; }
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio:true }); }
+    catch(e){ alert('Нет доступа к микрофону. Разреши его: Настройки iPhone → Safari → Микрофон.'); return; }
+    const mime = ['audio/mp4', 'audio/webm', 'audio/ogg'].find(t => MediaRecorder.isTypeSupported(t)) || '';
+    mr = new MediaRecorder(stream, mime ? { mimeType:mime } : undefined);
+    chunks = [];
+    mr.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+    mr.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      mic.classList.remove('on');
+      const type = (mr && mr.mimeType) || mime || 'audio/mp4';
+      const blob = new Blob(chunks, { type }); mr = null;
+      syncUI();
+      if (blob.size < 2000) return;
+      inp.placeholder = 'Распознаю речь...';
+      try {
+        const text = await transcribe(blob, type);
+        syncUI();
+        if (!text) return;
+        inp.value = text; autosize(); voiceNext = true; send();
+      } catch(e){ syncUI(); alert('Не удалось распознать речь: ' + e.message); }
+    };
+    mr.start(); mic.classList.add('on');
+    inp.placeholder = 'Слушаю... нажми ещё раз, когда закончишь';
   };
 }
 
@@ -397,6 +493,9 @@ if (SR) {
 const pop = $('#pop');
 $('#plus').onclick = e => { e.stopPropagation(); pop.classList.toggle('show'); };
 document.addEventListener('click', () => pop.classList.remove('show'));
+function voiceLabel(){ $('#p-voice').textContent = 'Озвучка ответов: ' + (cfg.speakAll ? 'вкл' : 'выкл'); }
+$('#p-voice').onclick = () => { cfg.speakAll = !cfg.speakAll; save(); unlockTTS(); if (!cfg.speakAll) { try { speechSynthesis.cancel(); } catch(e){} } };
+$('#plus').addEventListener('click', voiceLabel);
 $('#p-set').onclick = openSettings;
 $('#p-clear').onclick = () => {
   const c = cur(); if (!c) return;
@@ -420,8 +519,15 @@ function fillModels(list, selected){
   sel.innerHTML = all.map(m => '<option value="' + esc(m) + '">' + esc(m) + '</option>').join('');
   sel.value = selected;
 }
+function storageStatus(){
+  let ls = false;
+  try { localStorage.setItem('pf_t', '1'); ls = localStorage.getItem('pf_t') === '1'; localStorage.removeItem('pf_t'); } catch(e){}
+  const standalone = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
+  $('#s-store').textContent = 'Хранилище: ' + (ls ? 'работает' : 'НЕ работает (отключи приватный режим Safari)') + ' · ' + (standalone ? 'открыто с экрана «Домой»' : 'открыто во вкладке Safari');
+}
 function openSettings(){
   pop.classList.remove('show');
+  storageStatus();
   $('#s-key').value = cfg.key;
   $('#s-sys').value = cfg.system;
   fillModels(cfg.models, cfg.model);
@@ -460,8 +566,18 @@ $('#s-wipe').onclick = () => {
 };
 
 /* ---------- init ---------- */
-if (!cur()) curId = null;
-renderChat(); renderList();
+(async () => {
+  if (!chats.length && !cfg.key) {
+    const c = await idbGet('pf_chats'), g = await idbGet('pf_cfg'), u = await idbGet('pf_cur');
+    if (c && c.length) chats = c;
+    if (u) curId = u;
+    if (g) cfg = Object.assign(cfg, g);
+    else { const k = ckGet(); if (k) cfg = Object.assign(cfg, k); }
+    migrate();
+  }
+  if (!cur()) curId = null;
+  renderChat(); renderList();
+})();
 </script>
 </body>
 </html>
